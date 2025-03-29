@@ -1,0 +1,40 @@
+{
+  "name": "opsaway-b",
+  "version": "1.0.0",
+  "description": "OpsAway - Organization Management System Backend",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "NODE_ENV=production node src/app.js",
+    "dev": "NODE_ENV=development nodemon src/app.js",
+    "test": "NODE_ENV=test jest",
+    "test:watch": "NODE_ENV=test jest --watch",
+    "deploy": "chmod +x deploy.sh && ./deploy.sh",
+    "deploy:prod": "NODE_ENV=production npm run deploy",
+    "pm2:start": "pm2 start src/app.js --name opsaway-b",
+    "pm2:stop": "pm2 stop opsaway-b",
+    "pm2:restart": "pm2 restart opsaway-b",
+    "pm2:logs": "pm2 logs opsaway-b"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "express-validator": "^7.2.1",
+    "helmet": "^7.2.0",
+    "jsonwebtoken": "^9.0.2",
+    "mysql2": "^3.14.0",
+    "nodemailer": "^6.10.0",
+    "redis": "^4.7.0",
+    "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "nodemon": "^3.1.0",
+    "supertest": "^6.3.4"
+  }
+}
