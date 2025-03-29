@@ -34,62 +34,50 @@ class UserModel {
       throw error;
     }
   }
-  // 创建用户
-  static async create({ username, email, password_hash, full_name = null, phone_number = null }) {
+  // 创建用户 增加google_id 2025-03-29 19:30
+  static async create({ username, email, password_hash = null, full_name = null, phone_number = null, google_id = null }) {
     try {
-      console.log('Creating user:', {
-        username,
-        email,
-        passwordReceived: !!password_hash,
-        full_name,
-        phone_number
-      });
-      console.log('Received arguments:', { username, email, password_hash, full_name, phone_number });
-
-      // 验证必填字段
-      if (!password_hash || typeof password_hash !== 'string' || !password_hash.trim()) {
-        throw new Error('密码哈希值不能为空');
-      }
-
+      console.log('Creating user:', { username, email, passwordReceived: !!password_hash, full_name, phone_number, google_id });
+  
       if (!email || !email.trim()) {
         throw new Error('邮箱不能为空');
       }
-
+  
       if (!username || !username.trim()) {
         throw new Error('用户名不能为空');
       }
-
+  
       const id = uuidv4();
-      
-      // 构建插入查询
       const query = `
         INSERT INTO users (
-          id, username, email, password_hash,
+          id, username, email, password_hash, google_id,
           is_active, role, created_at, updated_at,
           full_name, phone_number, language
         ) VALUES (
-          ?, ?, ?, ?,
+          ?, ?, ?, ?, ?,
           1, 'user', NOW(), NOW(),
           ?, ?, 'en'
         )
       `;
-
-      // 执行插入操作
+  
       const [result] = await db.execute(query, [
         id,
         username.trim(),
         email.trim(),
         password_hash,
+        google_id,
         full_name ? full_name.trim() : null,
         phone_number ? phone_number.trim() : null
       ]);
-
+  
       console.log('User created successfully:', { id, email });
-
+  
       return {
         id,
         username,
         email,
+        password_hash,
+        google_id,
         full_name,
         phone_number,
         language: 'en',
@@ -294,6 +282,8 @@ class UserModel {
             deleted_reason = ?,
             deleted_email = email,
             email = NULL,
+            google_id = NULL,  -- 添加这行
+            facebook_id = NULL, -- 添加这行
             updated_at = NOW()
         WHERE id = ?
       `;
@@ -310,6 +300,28 @@ class UserModel {
       return true;
     } catch (error) {
       console.error('Deactivate account error:', error);
+      throw error;
+    }
+  }
+
+  // google 登录 2025-03-29 19:30
+  static async updateGoogleId(userId, googleId) {
+    try {
+      const query = `
+        UPDATE users 
+        SET google_id = ?, 
+            updated_at = NOW() 
+        WHERE id = ?
+      `;
+      const [result] = await db.execute(query, [googleId, userId]);
+      if (result.affectedRows === 0) {
+        throw new Error('用户不存在或更新失败');
+      }
+      const user = await this.findById(userId);
+      await redisService.set(`user:${userId}`, user, 3600);
+      return user;
+    } catch (error) {
+      console.error('Update Google ID error:', error);
       throw error;
     }
   }

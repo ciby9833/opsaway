@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const helmet = require('helmet');
 const path = require('path');
+const passport = require('./config/passport');
 
 // 导入配置和中间件
 const config = require('./config');
@@ -15,6 +16,10 @@ const app = express();
 app.use(helmet()); // 安全头
 app.use(express.json()); // 解析JSON请求体
 app.use(express.urlencoded({ extended: true })); // 解析URL编码请求体
+
+app.use(passport.initialize());
+// 如果使用 session（可选）
+// app.use(passport.session());
 
 // 使用响应处理中间件
 app.use(responseHandler);

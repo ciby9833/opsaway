@@ -8,6 +8,7 @@ const { getUserDeviceInfo } = require('../utils/device');
 const UserSessionModel = require('../models/user_session.model');
 const UserLoginLogModel = require('../models/user_login_log.model');
 const redisService = require('../config/redis');
+const passport = require('../config/passport');
 
 // 注册 2025-03-29 14:30
 class AuthController {
@@ -421,6 +422,68 @@ class AuthController {
         res.error('账号注销失败', 500);
       }
     }
+
+    // google 登录 2025-03-29 19:30
+    // 发起 Google 登录
+  googleLogin(req, res, next) {
+    passport.authenticate('google', { scope: ['profile', 'email'] })(req, res, next);
+  }
+
+  // Google 回调处理
+  async googleCallback(req, res, next) {
+    passport.authenticate('google', { session: false }, async (err, user) => {
+      if (err || !user) {
+        return res.status(401).json({ status: 'error', message: 'Google 登录失败' });
+      }
+
+      try {
+        // 生成会话和 token
+        const platform = req.headers['x-platform'] || 'web';
+        const session = await UserSessionModel.create({
+          user_id: user.id,
+          token: null,
+          refresh_token: null,
+          device_info: getUserDeviceInfo(req),
+          platform,
+          ip_address: req.ip,
+          is_active: 1,
+          expires_at: null,
+          refresh_token_expires_at: null
+        });
+        const { accessToken, refreshToken, expiresAt, refreshExpiresAt } = await generateTokens(user, session.id);
+        await UserSessionModel.update(session.id, {
+          token: accessToken,
+          refresh_token: refreshToken,
+          expires_at: expiresAt,
+          refresh_token_expires_at: refreshExpiresAt
+        });
+
+        // 更新缓存
+        const userCache = { id: user.id, username: user.username, email: user.email, full_name: user.full_name, role: user.role };
+        await redisService.set(`user:${user.id}`, userCache, config.jwt.expiration);
+        const sessionCache = { id: session.id, user_id: user.id, token: accessToken, platform, is_active: 1 };
+        await redisService.set(`session:${session.id}`, sessionCache, config.jwt.expiration);
+
+        // 更新最后登录时间
+        await UserModel.updateLastLogin(user.id);
+
+        // 返回 token
+        res.json({
+          status: 'success',
+          data: {
+            token: accessToken,
+            refresh_token: refreshToken,
+            expires_at: expiresAt,
+            refresh_expires_at: refreshExpiresAt,
+            user: { id: user.id, username: user.username, email: user.email, full_name: user.full_name, role: user.role }
+          }
+        });
+      } catch (error) {
+        console.error('Google callback error:', error);
+        res.status(500).json({ status: 'error', message: 'Google 登录失败，请稍后重试' });
+      }
+    })(req, res, next);
+  }
 }
 
 module.exports = new AuthController();
