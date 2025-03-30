@@ -23,8 +23,9 @@ router.post('/refresh-token', validateRefreshToken, authController.refreshToken)
 router.get('/google', authController.googleLogin);  // google 登录请求
 router.get('/google/callback', authController.googleCallback);  // google 登录回调
 
+
 // 需要认证的路由
-router.post('/logout', authMiddleware, authController.logout);
+router.post('/logout', authMiddleware, authController.logout); // 退出登录 2025-03-29 17:30
 router.get('/sessions', authMiddleware, authController.getUserSessions); // 获取用户的所有会话
 router.put('/update-profile', authMiddleware, authController.updateProfile); // 更新用户信息 2025-03-29 17:30
 router.get('/me', authMiddleware, authController.getCurrentUser); // 获取当前用户信息 2025-03-29 17:30
