@@ -17,11 +17,6 @@ const registerValidation = [
     .withMessage('密码长度必须在8-50字符之间')
     .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/)
     .withMessage('密码必须包含大小写字母和数字'),
-    body('organization_name')
-    .optional()
-    .trim()
-    .isLength({ min: 2, max: 255 })
-    .withMessage('组织名称长度必须在2-255字符之间'),
   (req, res, next) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {

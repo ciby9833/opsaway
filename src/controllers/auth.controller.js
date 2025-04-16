@@ -9,18 +9,15 @@ const UserSessionModel = require('../models/user_session.model');
 const UserLoginLogModel = require('../models/user_login_log.model');
 const redisService = require('../config/redis');
 const passport = require('../config/passport');
-const OrganizationModel = require('../models/organization.model');
 
 // 注册 2025-03-29 14:30
 class AuthController {
   async register(req, res) {
-    const conn = await db.getConnection();
     try {
-      await conn.beginTransaction();
 
       // 1. 保持原有的用户注册逻辑
       const rawEmail = req.body.email;
-      const { username, password, full_name, phone_number, organization_name } = req.body;
+      const { username, password, full_name, phone_number } = req.body;
       const timezone = req.headers['x-timezone'];
 
       // 2. 验证邮箱格式
@@ -48,42 +45,20 @@ class AuthController {
         full_name, 
         phone_number,
         timezone 
-      }, conn);
-
-      // 5. 如果提供了组织名称，则创建组织
-      let organization = null;
-      if (organization_name) {
-        try {
-          organization = await OrganizationModel.create({
-            name: organization_name.trim(),
-            owner_user_id: user.id
-          }, conn);
-
-          // 更新用户的组织关联
-          await UserModel.update(user.id, {
-            active_organization_id: organization.id,
-            default_organization_id: organization.id
-          }, conn);
-        } catch (orgError) {
-          console.error('Failed to create organization:', orgError);
-          // 组织创建失败不影响用户注册
-        }
-      }
+      });
 
       // 6. 发送欢迎邮件
       try {
         await sendEmail({ 
           to: email,
-          ...emailTemplates.auth.welcome(full_name || username, organization_name) 
+          ...emailTemplates.auth.welcome(full_name || username) 
         });
       } catch (emailError) {
         console.error('Failed to send welcome email:', emailError);
       }
 
-      await conn.commit();
-
-      // 7. 返回响应
-      const response = {
+      // 8. 返回响应
+       res.status(201).json({
         status: 'success',
         data: {
           user: {
@@ -95,26 +70,15 @@ class AuthController {
             language: user.language,
             timezone: user.timezone,
             created_at: user.created_at,
-            role: user.role
+            role: user.role,
+            profile_picture: user.profile_picture
           }
         }
-      };
+      });
 
-      // 如果创建了组织，添加组织信息到响应中
-      if (organization) {
-        response.data.organization = {
-          id: organization.id,
-          name: organization.name
-        };
-      }
-
-      res.status(201).json(response);
     } catch (error) {
-      await conn.rollback();
       console.error(`Registration failed: ${error.message}`);
       res.status(500).json({ status: 'error', message: '注册失败，请稍后重试' });
-    } finally {
-      conn.release();
     }
   }
 
