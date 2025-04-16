@@ -35,8 +35,17 @@ class UserModel {
     }
   }
   // 创建用户 增加google_id 2025-03-29 19:30
-  static async create({ username, email, password_hash = null, full_name = null, phone_number = null, google_id = null }) {
+  static async create({ username, email, password_hash = null, full_name = null, phone_number = null, google_id = null, timezone = null }) {
     try {
+      // 只在提供时区时才验证
+      if (timezone) {
+        try {
+          Intl.DateTimeFormat(undefined, { timeZone: timezone });
+        } catch (e) {
+          throw new Error('无效的时区格式');
+        }
+      }
+
       console.log('Creating user:', { username, email, passwordReceived: !!password_hash, full_name, phone_number, google_id });
   
       if (!email || !email.trim()) {
@@ -52,11 +61,11 @@ class UserModel {
         INSERT INTO users (
           id, username, email, password_hash, google_id,
           is_active, role, created_at, updated_at,
-          full_name, phone_number, language
+          full_name, phone_number, language, timezone
         ) VALUES (
           ?, ?, ?, ?, ?,
           1, 'user', NOW(), NOW(),
-          ?, ?, 'en'
+          ?, ?, 'en', ?
         )
       `;
   
@@ -67,7 +76,8 @@ class UserModel {
         password_hash,
         google_id,
         full_name ? full_name.trim() : null,
-        phone_number ? phone_number.trim() : null
+        phone_number ? phone_number.trim() : null,
+        timezone
       ]);
   
       console.log('User created successfully:', { id, email });
@@ -81,6 +91,7 @@ class UserModel {
         full_name,
         phone_number,
         language: 'en',
+        timezone,
         is_active: 1,
         role: 'user',
         created_at: new Date()
@@ -183,7 +194,8 @@ class UserModel {
     bio,
     location,
     language,
-    profile_picture
+    profile_picture,
+    timezone
   }) {
     try {
       const updates = [];
@@ -192,6 +204,17 @@ class UserModel {
       const oldUser = await this.findById(userId);
       if (!oldUser) {
         throw new Error('用户不存在');
+      }
+
+      // 添加时区验证和更新
+      if (timezone !== undefined) {
+        try {
+          Intl.DateTimeFormat(undefined, { timeZone: timezone });
+          updates.push('timezone = ?');
+          values.push(timezone);
+        } catch (e) {
+          throw new Error('无效的时区格式');
+        }
       }
 
       // 验证电话号码格式
@@ -249,7 +272,7 @@ class UserModel {
       const [rows] = await db.execute(
         `SELECT id, username, email, full_name, phone_number, 
                 bio, location, language, profile_picture, role,
-                created_at, updated_at, last_login
+                created_at, updated_at, last_login, timezone
          FROM users 
          WHERE id = ?`,
         [userId]
@@ -322,6 +345,38 @@ class UserModel {
       return user;
     } catch (error) {
       console.error('Update Google ID error:', error);
+      throw error;
+    }
+  }
+
+  // 添加更新时区方法
+  static async updateTimezone(userId, timezone) {
+    try {
+      // 验证时区
+      try {
+        Intl.DateTimeFormat(undefined, { timeZone: timezone });
+      } catch (e) {
+        throw new Error('无效的时区格式');
+      }
+
+      const query = `
+        UPDATE users 
+        SET timezone = ?, 
+            updated_at = NOW() 
+        WHERE id = ?
+      `;
+      const [result] = await db.execute(query, [timezone, userId]);
+      
+      if (result.affectedRows === 0) {
+        throw new Error('用户不存在或更新失败');
+      }
+
+      // 清除缓存
+      await redisService.del(`user:${userId}`);
+      
+      return true;
+    } catch (error) {
+      console.error('Update timezone error:', error);
       throw error;
     }
   }

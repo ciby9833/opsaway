@@ -10,16 +10,27 @@ const registerValidation = [
     .trim()
     .isEmail()
     .withMessage('请输入有效的邮箱地址')
-    .normalizeEmail(),
+    .toLowerCase()
+    .customSanitizer(value => value.toLowerCase()),
   body('password')
     .isLength({ min: 8, max: 50 })
     .withMessage('密码长度必须在8-50字符之间')
     .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/)
     .withMessage('密码必须包含大小写字母和数字'),
+    body('organization_name')
+    .optional()
+    .trim()
+    .isLength({ min: 2, max: 255 })
+    .withMessage('组织名称长度必须在2-255字符之间'),
   (req, res, next) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.error('输入验证失败', 400, errors.array());
+      return res.status(400).json({
+        success: false,
+        code: 400,
+        message: '输入验证失败',
+        errors: errors.array()
+      });
     }
     next();
   }
@@ -28,9 +39,10 @@ const registerValidation = [
 // 登录验证
 const validateLogin = [
   body('email')
+    .trim()
     .isEmail()
     .withMessage('请输入有效的邮箱地址')
-    .normalizeEmail(),
+    .toLowerCase(),
   body('password')
     .isLength({ min: 8 })
     .withMessage('密码长度不能小于8个字符'),
@@ -67,7 +79,7 @@ const validateForgotPassword = [
     .trim()
     .isEmail()
     .withMessage('请输入有效的邮箱地址')
-    .normalizeEmail(),
+    .toLowerCase(),
   (req, res, next) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -83,7 +95,7 @@ const validateResetPassword = [
     .trim()
     .isEmail()
     .withMessage('请输入有效的邮箱地址')
-    .normalizeEmail(),
+    .toLowerCase(),
   body('verificationCode')
     .trim()
     .isLength({ min: 6, max: 6 })
@@ -110,6 +122,14 @@ const validateUpdateProfile = [
   body('bio').optional().isLength({ max: 500 }).withMessage('简介长度不能超过500字符'),
   body('location').optional().isLength({ max: 255 }).withMessage('位置长度不能超过255字符'),
   body('language').optional().isIn(['en', 'zh', 'es']).withMessage('无效的语言选项'),
+  body('timezone').optional().custom(value => {
+    try {
+      Intl.DateTimeFormat(undefined, { timeZone: value });
+      return true;
+    } catch (e) {
+      throw new Error('无效的时区格式');
+    }
+  }),
   (req, res, next) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {

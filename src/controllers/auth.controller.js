@@ -9,33 +9,81 @@ const UserSessionModel = require('../models/user_session.model');
 const UserLoginLogModel = require('../models/user_login_log.model');
 const redisService = require('../config/redis');
 const passport = require('../config/passport');
+const OrganizationModel = require('../models/organization.model');
 
 // 注册 2025-03-29 14:30
 class AuthController {
   async register(req, res) {
+    const conn = await db.getConnection();
     try {
-      const { username, email, password, full_name, phone_number } = req.body;
-      console.log('Registration request:', { username, email, password: '***', full_name, phone_number });
+      await conn.beginTransaction();
 
+      // 1. 保持原有的用户注册逻辑
+      const rawEmail = req.body.email;
+      const { username, password, full_name, phone_number, organization_name } = req.body;
+      const timezone = req.headers['x-timezone'];
+
+      // 2. 验证邮箱格式
+      if (!rawEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rawEmail)) {
+        return res.status(400).json({ 
+          status: 'error', 
+          message: '无效的邮箱格式' 
+        });
+      }
+
+      const email = rawEmail.trim();
+
+      // 3. 检查邮箱是否已注册
       const existingUser = await UserModel.findByEmail(email);
       if (existingUser) {
         return res.status(400).json({ status: 'error', message: '邮箱已被注册' });
       }
 
+      // 4. 创建用户
       const password_hash = await hashPassword(password);
-      const user = await UserModel.create({ username, email, password_hash, full_name, phone_number });
-      console.log('Received request body:', req.body);
+      const user = await UserModel.create({ 
+        username, 
+        email,
+        password_hash, 
+        full_name, 
+        phone_number,
+        timezone 
+      }, conn);
 
+      // 5. 如果提供了组织名称，则创建组织
+      let organization = null;
+      if (organization_name) {
+        try {
+          organization = await OrganizationModel.create({
+            name: organization_name.trim(),
+            owner_user_id: user.id
+          }, conn);
+
+          // 更新用户的组织关联
+          await UserModel.update(user.id, {
+            active_organization_id: organization.id,
+            default_organization_id: organization.id
+          }, conn);
+        } catch (orgError) {
+          console.error('Failed to create organization:', orgError);
+          // 组织创建失败不影响用户注册
+        }
+      }
+
+      // 6. 发送欢迎邮件
       try {
         await sendEmail({ 
-          to: email, 
-          ...emailTemplates.auth.welcome(full_name || username) 
+          to: email,
+          ...emailTemplates.auth.welcome(full_name || username, organization_name) 
         });
       } catch (emailError) {
         console.error('Failed to send welcome email:', emailError);
       }
 
-      res.status(201).json({
+      await conn.commit();
+
+      // 7. 返回响应
+      const response = {
         status: 'success',
         data: {
           user: {
@@ -45,204 +93,292 @@ class AuthController {
             full_name: user.full_name,
             phone_number: user.phone_number,
             language: user.language,
+            timezone: user.timezone,
             created_at: user.created_at,
-            role: user.role,
-            profile_picture: user.profile_picture
+            role: user.role
           }
         }
-      });
+      };
+
+      // 如果创建了组织，添加组织信息到响应中
+      if (organization) {
+        response.data.organization = {
+          id: organization.id,
+          name: organization.name
+        };
+      }
+
+      res.status(201).json(response);
     } catch (error) {
+      await conn.rollback();
       console.error(`Registration failed: ${error.message}`);
       res.status(500).json({ status: 'error', message: '注册失败，请稍后重试' });
+    } finally {
+      conn.release();
     }
   }
 
   async login(req, res) {
     try {
-      const { email, password } = req.body;
-      const platform = req.headers['x-platform'] || 'web';
+        const { email, password } = req.body;
+        const platform = req.headers['x-platform'] || 'web';
+        const timezone = req.headers['x-timezone'];
 
-      const user = await UserModel.findByEmail(email);
-      if (!user) {
-        return res.status(401).json({ status: 'error', message: '账号不存在或密码错误' });
-      }
+        // 验证用户
+        const user = await UserModel.findByEmail(email);
+        if (!user || !user.is_active) {
+            return res.status(401).json({
+                status: 'error',
+                message: '账号不存在或已被禁用'
+            });
+        }
 
-      if (!user.is_active) {
-        return res.status(401).json({ status: 'error', message: '账号已被禁用' });
-      }
+        // 验证密码
+        const isValidPassword = await comparePassword(password, user.password_hash);
+        if (!isValidPassword) {
+            await UserLoginLogModel.create({
+                user_id: user.id,
+                ip_address: req.ip,
+                device_info: getUserDeviceInfo(req),
+                platform: platform,
+                success: false,
+                failure_reason: '密码错误'
+            });
+            return res.status(401).json({
+                status: 'error',
+                message: '账号不存在或密码错误'
+            });
+        }
 
-      const isValidPassword = await comparePassword(password, user.password_hash);
-      if (!isValidPassword) {
-        await UserLoginLogModel.create({
-          user_id: user.id,
-          ip_address: req.ip,
-          device_info: getUserDeviceInfo(req),
-          platform: 'web',
-          success: false,
-          failure_reason: '密码错误'
+        // 处理时区
+        if (timezone) {
+            try {
+                await UserModel.updateTimezone(user.id, timezone);
+                user.timezone = timezone;
+            } catch (timezoneError) {
+                console.warn('Invalid timezone:', timezoneError);
+                // 继续登录流程，不中断
+            }
+        }
+
+        // 使同平台旧会话失效
+        await UserSessionModel.invalidateSessionsByPlatform(user.id, platform);
+
+        // 创建新会话
+        const session = await UserSessionModel.create({
+            user_id: user.id,
+            device_info: getUserDeviceInfo(req),
+            platform: platform,
+            ip_address: req.ip,
+            timezone: user.timezone
         });
-        return res.status(401).json({ status: 'error', message: '账号不存在或密码错误' });
-      }
 
-      if (config.auth.singleSession) {
-        await UserSessionModel.invalidateUserSessions(user.id);
-      } else {
-        const activeSessionCount = await UserSessionModel.getActiveSessionCount(user.id);
-        if (activeSessionCount >= config.auth.maxActiveSessions) {
-          return res.status(400).json({ status: 'error', message: '已达到最大登录设备数限制' });
-        }
-      }
+        const { accessToken, refreshToken, expiresAt, refreshExpiresAt } = 
+            await generateTokens(user, session.id);
 
-      const session = await UserSessionModel.create({
-        user_id: user.id,
-        token: null,
-        refresh_token: null,
-        device_info: getUserDeviceInfo(req),
-        platform: platform,
-        ip_address: req.ip,
-        is_active: 1,
-        expires_at: null,
-        refresh_token_expires_at: null
-      });
+        // 更新会话信息
+        await UserSessionModel.update(session.id, {
+            token: accessToken,
+            refresh_token: refreshToken,
+            expires_at: expiresAt,
+            refresh_token_expires_at: refreshExpiresAt
+        });
 
-      const { accessToken, refreshToken, expiresAt, refreshExpiresAt } = await generateTokens(user, session.id);
-      console.log('Generated tokens:', { accessToken, refreshToken, expiresAt, refreshExpiresAt });
+        // 更新缓存
+        await redisService.set(
+            `session:${session.id}`,
+            {
+                id: session.id,
+                user_id: user.id,
+                token: accessToken,
+                platform: platform,
+                is_active: 1,
+                timezone: user.timezone
+            },
+            config.jwt.expiration
+        );
 
-      await UserSessionModel.update(session.id, {
-        token: accessToken,
-        refresh_token: refreshToken,
-        expires_at: expiresAt,
-        refresh_token_expires_at: refreshExpiresAt
-      });
+        // 更新用户最后登录时间
+        await UserModel.updateLastLogin(user.id);
 
-      const userCache = { id: user.id, username: user.username, email: user.email, full_name: user.full_name, role: user.role };
-      await redisService.set(`user:${user.id}`, userCache, config.jwt.expiration);
+        // 记录登录日志
+        await UserLoginLogModel.create({
+            user_id: user.id,
+            session_id: session.id,
+            ip_address: req.ip,
+            device_info: getUserDeviceInfo(req),
+            platform: platform,
+            success: true
+        });
 
-      const sessionCache = { id: session.id, user_id: user.id, token: accessToken, platform: platform, is_active: 1 };
-      await redisService.set(`session:${session.id}`, sessionCache, config.jwt.expiration);
-      console.log('Cached session:', sessionCache);
-
-      await UserModel.updateLastLogin(user.id);
-
-      await UserLoginLogModel.create({
-        user_id: user.id,
-        session_id: session.id,
-        ip_address: req.ip,
-        device_info: getUserDeviceInfo(req),
-        platform: 'web',
-        success: true
-      });
-
-      res.json({
-        status: 'success',
-        data: {
-          token: accessToken,
-          refresh_token: refreshToken,
-          expires_at: expiresAt,
-          refresh_expires_at: refreshExpiresAt,
-          user: { id: user.id, username: user.username, email: user.email, full_name: user.full_name, role: user.role }
-        }
-      });
+        res.json({
+            status: 'success',
+            data: {
+                token: accessToken,
+                refresh_token: refreshToken,
+                expires_at: expiresAt,
+                refresh_expires_at: refreshExpiresAt,
+                user: {
+                    id: user.id,
+                    username: user.username,
+                    email: user.email,
+                    full_name: user.full_name,
+                    role: user.role,
+                    timezone: user.timezone
+                }
+            }
+        });
     } catch (error) {
-      console.error('Login error:', error);
-      res.status(500).json({ status: 'error', message: '登录失败，请稍后重试' });
+        console.error('Login error:', error);
+        res.status(500).json({
+            status: 'error',
+            message: '登录失败，请稍后重试'
+        });
     }
   }
-
+  
+  // 刷新令牌 2025-04-13 17:00
   async refreshToken(req, res) {
     try {
-      const { refresh_token } = req.body;
-      if (!refresh_token) {
-        return res.status(400).json({ status: 'error', message: '刷新令牌不能为空' });
-      }
+        const { refresh_token } = req.body;
+        const platform = req.headers['x-platform'] || 'web';  // 保持与登录一致的平台处理
+        const timezone = req.headers['x-timezone'];
 
-      const session = await UserSessionModel.findByRefreshToken(refresh_token);
-      if (!session) {
-        return res.status(401).json({ status: 'error', message: '无效的刷新令牌' });
-      }
-
-      if (new Date() > new Date(session.refresh_token_expires_at)) {
-        await UserSessionModel.deleteById(session.id);
-        return res.status(401).json({ status: 'error', message: '刷新令牌已过期' });
-      }
-
-      const user = await UserModel.findById(session.user_id);
-      if (!user || !user.is_active) {
-        return res.status(401).json({ status: 'error', message: '用户不存在或已被禁用' });
-      }
-
-      const { accessToken, refreshToken, expiresAt, refreshExpiresAt } = await generateTokens(user, session.id);
-
-      await UserSessionModel.update(session.id, {
-        token: accessToken,
-        refresh_token: refreshToken,
-        expires_at: expiresAt,
-        refresh_token_expires_at: refreshExpiresAt
-      });
-
-      await redisService.set(
-        `session:${session.id}`,
-        { user_id: user.id, token: accessToken, refresh_token: refreshToken, platform: session.platform, is_active: 1 },
-        config.jwt.expiration
-      );
-
-      res.json({
-        status: 'success',
-        data: {
-          token: accessToken,
-          refresh_token: refreshToken,
-          expires_at: expiresAt,
-          refresh_expires_at: refreshExpiresAt,
-          user: { id: user.id, username: user.username, email: user.email, full_name: user.full_name, role: user.role }
+        if (!refresh_token) {
+            return res.status(400).json({
+                status: 'error',
+                message: '刷新令牌不能为空'
+            });
         }
-      });
+
+        const session = await UserSessionModel.findByRefreshToken(refresh_token);
+        if (!session) {
+            return res.status(401).json({
+                status: 'error',
+                message: '无效的刷新令牌'
+            });
+        }
+
+        // 优化过期时间检查
+        if (new Date() > new Date(session.refresh_token_expires_at)) {
+            await UserSessionModel.deleteById(session.id);
+            return res.status(401).json({
+                status: 'error',
+                message: '刷新令牌已过期'
+            });
+        }
+
+        const user = await UserModel.findById(session.user_id);
+        if (!user || !user.is_active) {
+            return res.status(401).json({
+                status: 'error',
+                message: '用户不存在或已被禁用'
+            });
+        }
+
+        // 优化时区处理
+        if (timezone && timezone !== user.timezone) {
+            try {
+                await UserModel.updateTimezone(user.id, timezone);
+                user.timezone = timezone;
+            } catch (timezoneError) {
+                console.warn('Invalid timezone:', timezoneError);
+                // 继续处理，不中断流程
+            }
+        }
+
+        const { accessToken, refreshToken, expiresAt, refreshExpiresAt } = 
+            await generateTokens(user, session.id);
+
+        // 更新会话
+        await UserSessionModel.update(session.id, {
+            token: accessToken,
+            refresh_token: refreshToken,
+            expires_at: expiresAt,
+            refresh_token_expires_at: refreshExpiresAt
+        });
+
+        // 优化缓存更新
+        const sessionCache = {
+            id: session.id,
+            user_id: user.id,
+            token: accessToken,
+            platform: session.platform,
+            is_active: 1,
+            timezone: user.timezone
+        };
+        await redisService.set(`session:${session.id}`, sessionCache, config.jwt.expiration);
+
+        res.json({
+            status: 'success',
+            data: {
+                token: accessToken,
+                refresh_token: refreshToken,
+                expires_at: expiresAt,
+                refresh_expires_at: refreshExpiresAt,
+                user: {
+                    id: user.id,
+                    username: user.username,
+                    email: user.email,
+                    full_name: user.full_name,
+                    role: user.role,
+                    timezone: user.timezone
+                }
+            }
+        });
     } catch (error) {
-      console.error('刷新令牌错误:', error);
-      res.status(500).json({ status: 'error', message: '刷新令牌失败，请稍后重试' });
+        console.error('刷新令牌错误:', error);
+        res.status(500).json({
+            status: 'error',
+            message: '刷新令牌失败，请稍后重试'
+        });
     }
   }
   //登出 2025-03-29 14:30
   async logout(req, res) {
     try {
-      const userId = req.user.id;
-      const sessionId = req.sessionId; // 从 auth 中间件注入的 sessionId
-      const platform = req.headers['x-platform'] || 'web';
+        const userId = req.user.id;
+        const sessionId = req.sessionId;
+        const platform = req.headers['x-platform']; // 依据请求识别
 
-      // 1. 获取用户所有活跃会话
-      const sessions = await UserSessionModel.findActiveSessionsByUserId(userId);
-      const currentSession = sessions.find(session => session.id === sessionId);
-      
-      if (!currentSession) {
-        return res.error('无效的会话', 400);
-      }
+        const sessions = await UserSessionModel.findActiveSessionsByUserId(userId);
+        const currentSession = sessions.find(session => session.id === sessionId);
+        
+        if (!currentSession) {
+            return res.status(400).json({
+                status: 'error',
+                message: '无效的会话'
+            });
+        }
 
-      // 2. 筛选出相同平台的会话
-      const platformSessions = sessions.filter(session => session.platform === platform);
+        // 使用平台的会话失效
+        await UserSessionModel.invalidateSessionsByPlatform(userId, platform);
 
-      // 3. 使用模型提供的方法使会话失效
-      for (const session of platformSessions) {
-        await UserSessionModel.deleteById(session.id);
-      }
+        // 清除缓存
+        await redisService.del(`user:${userId}`);
+        await redisService.del(`user_sessions:${userId}`);
 
-      // 4. 清除用户相关的缓存
-      await redisService.del(`user:${userId}`);
-      await redisService.del(`user_sessions:${userId}`);
+        // 记录登出日志
+        await UserLoginLogModel.create({
+            user_id: userId,
+            session_id: sessionId,
+            ip_address: req.ip,
+            device_info: getUserDeviceInfo(req),
+            platform: platform,
+            success: true,
+            action: 'logout'
+        });
 
-      // 5. 记录登出日志
-      await UserLoginLogModel.create({
-        user_id: userId,
-        session_id: sessionId,
-        ip_address: req.ip,
-        device_info: getUserDeviceInfo(req),
-        platform: platform,
-        success: true,
-        action: 'logout'
-      });
-
-      res.success(null, '已成功登出');
+        res.json({
+            status: 'success',
+            message: '已成功登出'
+        });
     } catch (error) {
-      console.error('Logout error:', error);
-      res.error('登出失败，请稍后重试', 500);
+        console.error('Logout error:', error);
+        res.status(500).json({
+            status: 'error',
+            message: '登出失败，请稍后重试'
+        });
     }
   }
   //获取会话列表 2025-03-29 14:30
@@ -260,7 +396,8 @@ class AuthController {
           ip_address: session.ip_address,
           last_active: session.last_active,
           expires_at: session.expires_at,
-          is_current: session.id === req.sessionId
+          is_current: session.id === req.sessionId,
+          timezone: session.timezone  // 添加时区信息 
         });
         return acc;
       }, {});
@@ -336,7 +473,27 @@ class AuthController {
     async updateProfile(req, res) {
       try {
         const userId = req.user.id;
-        const { phone_number, full_name, bio, location, language, profile_picture } = req.body;
+        const { 
+          phone_number, 
+          full_name, 
+          bio, 
+          location, 
+          language, 
+          profile_picture,
+          timezone  // 从请求体获取时区
+        } = req.body;
+
+        // 验证时区格式（如果提供了时区）
+        if (timezone) {
+          try {
+            Intl.DateTimeFormat(undefined, { timeZone: timezone });
+          } catch (e) {
+            return res.status(400).json({ 
+              status: 'error', 
+              message: '无效的时区格式' 
+            });
+          }
+        }
 
         const updatedUser = await UserModel.updateProfile(userId, {
           phone_number,
@@ -344,13 +501,37 @@ class AuthController {
           bio,
           location,
           language,
-          profile_picture
+          profile_picture,
+          timezone  // 传递时区到模型方法
         });
 
-        res.success(updatedUser, '个人资料更新成功');
+        res.json({
+          status: 'success',
+          message: '个人资料更新成功',
+          data: {
+            user: {
+              id: updatedUser.id,
+              username: updatedUser.username,
+              email: updatedUser.email,
+              full_name: updatedUser.full_name,
+              phone_number: updatedUser.phone_number,
+              bio: updatedUser.bio,
+              location: updatedUser.location,
+              language: updatedUser.language,
+              timezone: updatedUser.timezone,  // 确保返回更新后的时区
+              profile_picture: updatedUser.profile_picture,
+              role: updatedUser.role,
+              created_at: updatedUser.created_at,
+              updated_at: updatedUser.updated_at
+            }
+          }
+        });
       } catch (error) {
         console.error('Update profile error:', error);
-        res.error(error.message, 400);
+        res.status(400).json({ 
+          status: 'error', 
+          message: error.message || '更新个人资料失败' 
+        });
       }
     }
 
@@ -361,27 +542,38 @@ class AuthController {
         const user = await UserModel.findById(userId);
         
         if (!user) {
-          return res.error('用户不存在', 404);
+            return res.status(404).json({
+                status: 'error',
+                message: '用户不存在'
+            });
         }
 
-        res.success({
-          id: user.id,
-          username: user.username,
-          email: user.email,
-          full_name: user.full_name,
-          phone_number: user.phone_number,
-          bio: user.bio,
-          location: user.location,
-          language: user.language,
-          profile_picture: user.profile_picture,
-          role: user.role,
-          created_at: user.created_at,
-          updated_at: user.updated_at,
-          last_login: user.last_login
-        }, '获取用户信息成功');
+        res.json({
+            status: 'success',
+            message: '获取用户信息成功',
+            data: {
+                id: user.id,
+                username: user.username,
+                email: user.email,
+                full_name: user.full_name,
+                phone_number: user.phone_number,
+                bio: user.bio,
+                location: user.location,
+                language: user.language,
+                profile_picture: user.profile_picture,
+                role: user.role,
+                created_at: user.created_at,
+                updated_at: user.updated_at,
+                last_login: user.last_login,
+                timezone: user.timezone
+            }
+        });
       } catch (error) {
         console.error('Get current user error:', error);
-        res.error('获取用户信息失败', 500);
+        res.status(500).json({
+            status: 'error',
+            message: '获取用户信息失败'
+        });
       }
     }
 
@@ -391,35 +583,45 @@ class AuthController {
         const userId = req.user.id;
         const { deleted_reason } = req.body;
 
-        // 先获取用户信息（包括邮箱），用于后续发送邮件
         const user = await UserModel.findById(userId);
         if (!user) {
-          return res.error('用户不存在', 404);
+            return res.status(404).json({
+                success: false,
+                code: 404,
+                message: '用户不存在',
+                data: null
+            });
         }
-        
-        const userEmail = user.email; // 保存邮箱，因为注销后会被清空
+
+        const userEmail = user.email;
         const username = user.username;
 
-        // 注销账号
         await UserModel.deactivateAccount(userId, deleted_reason);
-        
-        // 使所有会话失效
         await UserSessionModel.invalidateUserSessions(userId);
 
-        // 发送注销确认邮件
         try {
-          await sendEmail({
-            to: userEmail,
-            ...emailTemplates.auth.accountDeactivation(username)
-          });
+            await sendEmail({
+                to: userEmail,
+                ...emailTemplates.auth.accountDeactivation(username)
+            });
         } catch (emailError) {
-          console.error('Failed to send deactivation email:', emailError);
+            console.error('Failed to send deactivation email:', emailError);
         }
 
-        res.success(null, '账号已成功注销');
+        return res.status(200).json({
+            success: true,
+            code: 200,
+            message: '账号已成功注销',
+            data: null
+        });
       } catch (error) {
         console.error('Account deactivation error:', error);
-        res.error('账号注销失败', 500);
+        return res.status(500).json({
+            success: false,
+            code: 500,
+            message: '账号注销失败，请稍后重试',
+            data: null
+        });
       }
     }
 
@@ -432,56 +634,99 @@ class AuthController {
   // Google 回调处理
   async googleCallback(req, res, next) {
     passport.authenticate('google', { session: false }, async (err, user) => {
-      if (err || !user) {
-        return res.status(401).json({ status: 'error', message: 'Google 登录失败' });
-      }
+        if (err || !user) {
+            return res.status(401).json({ status: 'error', message: 'Google 登录失败' });
+        }
 
-      try {
-        // 生成会话和 token
-        const platform = req.headers['x-platform'] || 'web';
-        const session = await UserSessionModel.create({
-          user_id: user.id,
-          token: null,
-          refresh_token: null,
-          device_info: getUserDeviceInfo(req),
-          platform,
-          ip_address: req.ip,
-          is_active: 1,
-          expires_at: null,
-          refresh_token_expires_at: null
-        });
-        const { accessToken, refreshToken, expiresAt, refreshExpiresAt } = await generateTokens(user, session.id);
-        await UserSessionModel.update(session.id, {
-          token: accessToken,
-          refresh_token: refreshToken,
-          expires_at: expiresAt,
-          refresh_token_expires_at: refreshExpiresAt
-        });
+        try {
+            const platform = req.headers['x-platform'];
+            const timezone = req.headers['x-timezone'];
 
-        // 更新缓存
-        const userCache = { id: user.id, username: user.username, email: user.email, full_name: user.full_name, role: user.role };
-        await redisService.set(`user:${user.id}`, userCache, config.jwt.expiration);
-        const sessionCache = { id: session.id, user_id: user.id, token: accessToken, platform, is_active: 1 };
-        await redisService.set(`session:${session.id}`, sessionCache, config.jwt.expiration);
+            // 验证平台
+            if (!UserSessionModel.PLATFORMS.includes(platform)) {
+                return res.status(400).json({ status: 'error', message: '无效的平台类型' });
+            }
 
-        // 更新最后登录时间
-        await UserModel.updateLastLogin(user.id);
+            // 更新用户时区（如果提供）
+            if (timezone) {
+                try {
+                    await UserModel.updateTimezone(user.id, timezone);
+                    user.timezone = timezone;
+                } catch (timezoneError) {
+                    console.error('Failed to update timezone:', timezoneError);
+                }
+            }
 
-        // 返回 token
-        res.json({
-          status: 'success',
-          data: {
-            token: accessToken,
-            refresh_token: refreshToken,
-            expires_at: expiresAt,
-            refresh_expires_at: refreshExpiresAt,
-            user: { id: user.id, username: user.username, email: user.email, full_name: user.full_name, role: user.role }
-          }
-        });
-      } catch (error) {
-        console.error('Google callback error:', error);
-        res.status(500).json({ status: 'error', message: 'Google 登录失败，请稍后重试' });
-      }
+            // 使同一平台的旧会话失效
+            await UserSessionModel.invalidateSessionsByPlatform(user.id, platform);
+
+            // 创建新会话
+            const session = await UserSessionModel.create({
+                user_id: user.id,
+                token: null,
+                refresh_token: null,
+                device_info: getUserDeviceInfo(req),
+                platform,
+                ip_address: req.ip,
+                is_active: 1,
+                expires_at: null,
+                refresh_token_expires_at: null,
+                timezone: user.timezone
+            });
+
+            const { accessToken, refreshToken, expiresAt, refreshExpiresAt } = await generateTokens(user, session.id);
+            await UserSessionModel.update(session.id, {
+                token: accessToken,
+                refresh_token: refreshToken,
+                expires_at: expiresAt,
+                refresh_token_expires_at: refreshExpiresAt,
+                timezone: user.timezone
+            });
+
+            const userCache = { 
+                id: user.id, 
+                username: user.username, 
+                email: user.email, 
+                full_name: user.full_name, 
+                role: user.role,
+                timezone: user.timezone
+            };
+            await redisService.set(`user:${user.id}`, userCache, config.jwt.expiration);
+
+            const sessionCache = { 
+                id: session.id, 
+                user_id: user.id, 
+                token: accessToken, 
+                platform, 
+                is_active: 1,
+                timezone: user.timezone
+            };
+            await redisService.set(`session:${session.id}`, sessionCache, config.jwt.expiration);
+
+            await UserModel.updateLastLogin(user.id);
+
+            res.json({
+                status: 'success',
+                data: {
+                    token: accessToken,
+                    refresh_token: refreshToken,
+                    expires_at: expiresAt,
+                    refresh_expires_at: refreshExpiresAt,
+                    session_id: session.id, // 新增
+                    user: { 
+                        id: user.id, 
+                        username: user.username, 
+                        email: user.email, 
+                        full_name: user.full_name, 
+                        role: user.role,
+                        timezone: user.timezone
+                    }
+                }
+            });
+        } catch (error) {
+            console.error('Google callback error:', error);
+            res.status(500).json({ status: 'error', message: 'Google 登录失败，请稍后重试' });
+        }
     })(req, res, next);
   }
 }

@@ -1,6 +1,9 @@
 const AdminModel = require('../models/admin.model');
 const redisService = require('../config/redis');
 const db = require('../config/database');
+const UserSessionModel = require('../models/user_session.model');
+const emailTemplates = require('../templates');
+const { sendEmail } = require('../config/email');
 
 class AdminController {
   async getUsers(req, res) {    // 获取用户列表 2025-03-30 10:00
@@ -170,39 +173,122 @@ class AdminController {
   }
 
   async deleteUser(req, res) {
+    const conn = await db.getConnection();
     try {
+      await conn.beginTransaction();
+      
       const { userId } = req.params;
-      const { reason } = req.body;
+      const deleted_reason = req.body.reason || null;
 
       if (!userId || !/^[a-f0-9-]{36}$/.test(userId)) {
-        return res.status(400).json({ status: 'error', message: '无效的用户 ID' });
-      }
-      if (reason && typeof reason !== 'string') {
-        return res.status(400).json({ status: 'error', message: '删除原因必须是字符串' });
+        await conn.rollback();
+        return res.status(400).json({
+          success: false,
+          code: 400,
+          message: '无效的用户 ID',
+          data: null
+        });
       }
 
-      const [userCheck] = await db.execute('SELECT role, is_active FROM users WHERE id = ?', [userId]);
+      const [userCheck] = await conn.execute(
+        'SELECT email, username, role, is_active FROM users WHERE id = ?',
+        [userId]
+      );
+
       if (!userCheck.length) {
-        return res.status(404).json({ status: 'error', message: '用户不存在' });
-      }
-      if (!userCheck[0].is_active) {
-        return res.status(400).json({ status: 'error', message: '用户已被删除' });
-      }
-      if (userCheck[0].role === 'superadministrator') {
-        return res.status(403).json({ status: 'error', message: '不能删除超级管理员账户' });
+        await conn.rollback();
+        return res.status(404).json({
+          success: false,
+          code: 404,
+          message: '用户不存在',
+          data: null
+        });
       }
 
-      await AdminModel.deleteUser(userId, reason);
-      await AdminModel.terminateUserSessions(userId);
-      await redisService.del(`user:${userId}`);
-      
-      res.json({
-        status: 'success',
-        message: '用户已标记为删除'
+      const user = userCheck[0];
+
+      if (!user.is_active) {
+        await conn.rollback();
+        return res.status(400).json({
+          success: false,
+          code: 400,
+          message: '用户已被删除',
+          data: null
+        });
+      }
+
+      if (user.role === 'superadministrator') {
+        await conn.rollback();
+        return res.status(403).json({
+          success: false,
+          code: 403,
+          message: '不能删除超级管理员账户',
+          data: null
+        });
+      }
+
+      await conn.execute(
+        `UPDATE users 
+         SET is_active = 0,
+             deleted_at = NOW(),
+             deleted_reason = ?,
+             deleted_email = email,
+             email = NULL,
+             updated_at = NOW()
+         WHERE id = ?`,
+        [deleted_reason, userId]
+      );
+
+      await UserSessionModel.invalidateUserSessions(userId);
+
+      await redisService.del([
+        `user:${userId}`,
+        `user_sessions:${userId}`
+      ]);
+
+      try {
+        console.log('准备发送删除通知邮件给用户:', {
+          email: user.email,
+          username: user.username,
+          reason: deleted_reason
+        });
+        
+        const emailContent = emailTemplates.admin.userDeletion(user.username, deleted_reason);
+        console.log('邮件内容:', emailContent);
+        
+        const emailResult = await sendEmail({
+          to: user.email,
+          ...emailContent
+        });
+        
+        console.log('邮件发送成功:', emailResult);
+      } catch (emailError) {
+        console.error('邮件发送失败:', {
+          error: emailError.message,
+          stack: emailError.stack,
+          user: user.email
+        });
+      }
+
+      await conn.commit();
+
+      return res.status(200).json({
+        success: true,
+        code: 200,
+        message: '用户已成功删除',
+        data: null
       });
     } catch (error) {
+      await conn.rollback();
       console.error('Delete user error:', error);
-      res.status(500).json({ status: 'error', message: '服务器错误：删除用户失败' });
+      return res.status(500).json({
+        success: false,
+        code: 500,
+        message: '删除用户失败，请稍后重试',
+        data: null
+      });
+    } finally {
+      conn.release();
     }
   }
 

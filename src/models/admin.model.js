@@ -145,8 +145,36 @@ class AdminModel {
   static async deleteUser(userId, reason = null) {
     const conn = await db.getConnection();
     try {
-      const query = 'UPDATE users SET is_active = 0, deleted_at = NOW(), deleted_reason = ? WHERE id = ?';
-      await conn.execute(query, [reason, userId]);
+      await conn.beginTransaction();
+      
+      // 保存用户邮箱
+      const [user] = await conn.execute(
+        'SELECT email FROM users WHERE id = ?',
+        [userId]
+      );
+      
+      if (!user.length) {
+        throw new Error('用户不存在');
+      }
+      
+      // 更新用户状态
+      await conn.execute(
+        `UPDATE users 
+         SET is_active = 0,
+             deleted_at = NOW(),
+             deleted_reason = ?,
+             deleted_email = email,
+             email = NULL,
+             updated_at = NOW()
+         WHERE id = ?`,
+        [reason, userId]
+      );
+      
+      await conn.commit();
+      return true;
+    } catch (error) {
+      await conn.rollback();
+      throw error;
     } finally {
       conn.release();
     }

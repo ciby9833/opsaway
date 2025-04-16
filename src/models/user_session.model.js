@@ -15,7 +15,10 @@ class UserSessionModel {
     ip_address,
     is_active = 1,
     expires_at,
-    refresh_token_expires_at
+    refresh_token_expires_at,
+    timezone = 'Asia/Jakarta',  // 设置默认时区
+    platform_version = null,     // 新增平台版本字段
+    session_type = 'normal'      // 设置默认会话类型
   }) {
     try {
       // 检查平台类型是否有效
@@ -24,20 +27,56 @@ class UserSessionModel {
       }
 
       const id = uuidv4();
+      
+      // 确保所有可能为 undefined 的值都转换为 null
+      const params = [
+        id,
+        user_id,
+        token || null,
+        refresh_token || null,
+        device_info || null,
+        platform,
+        platform_version,
+        ip_address || null,
+        null,  // last_active 默认为 null
+        expires_at || null,
+        refresh_token_expires_at || null,
+        is_active,
+        timezone,
+        session_type
+      ];
+
       const [result] = await db.execute(
-        `INSERT INTO user_sessions 
-        (id, user_id, token, refresh_token, device_info, platform, 
-         ip_address, is_active, expires_at, refresh_token_expires_at) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [id, user_id, token, refresh_token, device_info, platform, 
-         ip_address, is_active, expires_at, refresh_token_expires_at]
+        `INSERT INTO user_sessions (
+          id, user_id, token, refresh_token, device_info, 
+          platform, platform_version, ip_address, last_active,
+          expires_at, refresh_token_expires_at, is_active, 
+          timezone, session_type
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        params
       );
 
-      return { id, user_id, token, refresh_token, device_info, platform, ip_address, is_active, expires_at, refresh_token_expires_at };
+      return {
+        id,
+        user_id,
+        token: token || null,
+        refresh_token: refresh_token || null,
+        device_info: device_info || null,
+        platform,
+        platform_version,
+        ip_address: ip_address || null,
+        is_active,
+        expires_at: expires_at || null,
+        refresh_token_expires_at: refresh_token_expires_at || null,
+        timezone,
+        session_type,
+        created_at: new Date(),
+        updated_at: new Date()
+      };
     } catch (error) {
-    console.error('Create session error:', error);
-    throw error;
-   } 
+      console.error('Create session error:', error);
+      throw error;
+    }
   }
 
   // 更新会话
@@ -69,16 +108,6 @@ class UserSessionModel {
     try {
       console.log(`[Session] Finding active sessions for user: ${userId}`);
       
-      // 1. 尝试从Redis获取
-      const cacheKey = `user_sessions:${userId}`;
-      const cachedSessions = await redisService.get(cacheKey);
-      
-      if (cachedSessions) {
-        console.log(`[Session] Found cached sessions: ${JSON.stringify(cachedSessions)}`);
-        return cachedSessions;
-      }
-
-      // 2. 从数据库获取
       const [rows] = await db.execute(
         `SELECT * FROM user_sessions 
         WHERE user_id = ? 
@@ -90,20 +119,21 @@ class UserSessionModel {
 
       console.log(`[Session] Found ${rows.length} sessions in database`);
 
-      // 3. 处理会话数据
       const sessions = rows.map(session => ({
         id: session.id,
         device_info: JSON.parse(session.device_info),
         platform: session.platform,
         ip_address: session.ip_address,
         created_at: session.created_at,
-        last_active : session.last_active ,
-        expires_at: session.expires_at
+        last_active: session.last_active,
+        expires_at: session.expires_at,
+        timezone: session.timezone  // 确保包含时区
       }));
 
-      // 4. 缓存结果
+      // 更新缓存
       if (sessions.length > 0) {
-        await redisService.set(cacheKey, sessions, 300); // 缓存5分钟
+        const cacheKey = `user_sessions:${userId}`;
+        await redisService.set(cacheKey, sessions, 300);
       }
 
       return sessions;
@@ -178,6 +208,50 @@ class UserSessionModel {
     );
     return rows[0].count;
   }
+// 单个平台失效04-13 17:00
+  static async invalidateSessionsByPlatform(userId, platform) {
+    const conn = await db.getConnection();
+    try {
+        await conn.beginTransaction();
+        
+        // 直接更新，不需要先查询
+        const [result] = await conn.execute(
+            `UPDATE user_sessions 
+             SET is_active = 0, 
+                 updated_at = NOW() 
+             WHERE user_id = ? 
+             AND platform = ? 
+             AND is_active = 1`,
+            [userId, platform]
+        );
+
+        // 获取被更新的会话ID用于清理缓存
+        const [updatedSessions] = await conn.execute(
+            `SELECT id FROM user_sessions 
+             WHERE user_id = ? 
+             AND platform = ? 
+             AND is_active = 0 
+             AND updated_at >= DATE_SUB(NOW(), INTERVAL 1 SECOND)`,
+            [userId, platform]
+        );
+
+        await conn.commit();
+
+        // Redis 缓存处理
+        if (updatedSessions.length > 0) {
+            const sessionKeys = updatedSessions.map(session => `session:${session.id}`);
+            await redisService.del([...sessionKeys, `user_sessions:${userId}`]);
+        }
+
+        return true;
+    } catch (error) {
+        await conn.rollback();
+        throw error;
+    } finally {
+        conn.release();
+    }
+  }
+
 }
 
 module.exports = UserSessionModel;

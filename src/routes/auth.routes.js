@@ -3,6 +3,7 @@ const router = express.Router();
 const authController = require('../controllers/auth.controller');
 const { registerValidation, validateLogin, validateRefreshToken } = require('../middleware/validation');
 const { authMiddleware } = require('../middleware/auth');
+const UserSessionModel = require('../models/user_session.model');
 
 // 注册路由
 router.post('/register', registerValidation, authController.register);

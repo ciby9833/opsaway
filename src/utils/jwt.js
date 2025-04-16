@@ -12,7 +12,8 @@ const generateTokens = async (user, sessionId) => {
     { 
       userId: user.id,
       role: user.role,
-      sessionId: sessionId  // 添加 sessionId
+      sessionId: sessionId,
+      timezone: user.timezone  // 移除默认值，直接使用用户的时区
     },
     config.jwt.secret,
     { expiresIn: config.jwt.expiration } // 使用配置的过期时间（秒）
@@ -22,7 +23,8 @@ const generateTokens = async (user, sessionId) => {
   const refreshToken = jwt.sign(
     { 
       userId: user.id,
-      sessionId: sessionId  // 添加 sessionId
+      sessionId: sessionId,
+      timezone: user.timezone  // 移除默认值，直接使用用户的时区
     },
     config.jwt.refreshSecret,
     { expiresIn: config.jwt.refreshExpiration } // 使用配置的刷新过期时间（秒）
@@ -43,17 +45,27 @@ const generateTokens = async (user, sessionId) => {
 // 验证 JWT 令牌
 const verifyToken = async (token) => {
     try {
-      if (!token) {
-        throw new Error('令牌不能为空');
-      }
-  
-      const decoded = await jwt.verify(token, config.jwt.secret);
-      return decoded;
+        if (!token) {
+            throw new Error('令牌不能为空');
+        }
+
+        const decoded = await jwt.verify(token, config.jwt.secret);
+        
+        // 验证时区是否有效
+        if (decoded.timezone) {
+            try {
+                Intl.DateTimeFormat(undefined, { timeZone: decoded.timezone });
+            } catch (e) {
+                console.warn(`Invalid timezone in token: ${decoded.timezone}`);
+            }
+        }
+
+        return decoded;
     } catch (error) {
-      console.error('Token verification failed:', error.message);
-      return null; // 返回 null 表示验证失败
+        console.error('Token verification failed:', error.message);
+        return null;
     }
-  };
+};
 
 
 module.exports = {

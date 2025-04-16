@@ -63,6 +63,24 @@ class RedisService {
       throw error;
     }
   }
+
+  // 添加关闭连接方法
+  async quit() {
+    try {
+      await this.client.quit();
+    } catch (error) {
+      console.error('Redis quit error:', error);
+    }
+  }
+
+  // 添加断开连接方法
+  async disconnect() {
+    try {
+      await this.client.disconnect();
+    } catch (error) {
+      console.error('Redis disconnect error:', error);
+    }
+  }
 }
 
 module.exports = new RedisService();
